@@ -8,7 +8,7 @@ Simple web GUI to capture a still photo from the Raspberry Pi camera.
   older `libcamera-still` name if that's what's installed.
 
 Run:
-    python3 mypicam.py
+    python3 app.py
 Then browse to:
     http://<pi-ip-address>:5000
 """
