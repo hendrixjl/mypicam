@@ -12,7 +12,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(bytes(html, "utf8"))
 
 # Configure the server address and port
-server_address = ("localhost", 8000)
+server_address = ("192.168.4.29", 8000)
 httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
 
 print("Server running on http://localhost:8000...")
