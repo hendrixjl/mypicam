@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Change 'pi' and the path below to match your actual username/clone location.
-User=pi
-WorkingDirectory=/home/pi/pi_camera_gui
-ExecStart=/home/pi/pi_camera_gui/run.sh
+User=hendrixj
+WorkingDirectory=/home/hendrixj/mypicam
+ExecStart=/home/hendrixj/mypicam/run.sh
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
