@@ -14,6 +14,7 @@ Then browse to:
     http://<pi-ip-address>:5000
 """
 
+import json
 import shutil
 import subprocess
 import datetime
@@ -54,6 +55,69 @@ PARAM_SPECS = {
 
 # Prefer the current command name; fall back to the legacy one.
 CAMERA_CMD = shutil.which("rpicam-still") or shutil.which("libcamera-still")
+
+# Persisted "defaults" (resolution + slider values) so the last-saved settings
+# are reloaded automatically the next time the app starts. Kept alongside
+# app.py but NOT meant to be committed to git (add it to .gitignore) since
+# it's per-device/user state, not code.
+SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
+
+BUILTIN_DEFAULTS = {
+    "resolution": next(iter(RESOLUTIONS)),
+    **{key: spec["default"] for key, spec in PARAM_SPECS.items()},
+}
+
+
+def load_settings():
+    """
+    Load saved default settings from disk, falling back to the built-in
+    defaults for anything missing, corrupted, or out of range.
+    """
+    settings = dict(BUILTIN_DEFAULTS)
+
+    if not SETTINGS_FILE.exists():
+        return settings
+
+    try:
+        saved = json.loads(SETTINGS_FILE.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"WARNING: could not read {SETTINGS_FILE}: {e}")
+        return settings
+
+    if not isinstance(saved, dict):
+        return settings
+
+    if saved.get("resolution") in RESOLUTIONS:
+        settings["resolution"] = saved["resolution"]
+
+    for key in PARAM_SPECS:
+        if key in saved:
+            try:
+                settings[key] = _validate_range(key, saved[key], PARAM_SPECS[key])
+            except ValueError:
+                pass  # keep the built-in default for this one field
+
+    return settings
+
+
+def save_settings(data):
+    """Validate incoming settings and atomically persist them to disk."""
+    resolution = data.get("resolution")
+    if resolution not in RESOLUTIONS:
+        raise ValueError(f"Unknown resolution '{resolution}'.")
+
+    validated = {"resolution": resolution}
+    for key in PARAM_SPECS:
+        validated[key] = _validate_range(key, data.get(key, PARAM_SPECS[key]["default"]), PARAM_SPECS[key])
+
+    # Reuses the same crop-margin validation as an actual capture, so an
+    # invalid combination (e.g. left + right >= 100%) is rejected here too.
+    _roi_from_margins(validated["top"], validated["bottom"], validated["left"], validated["right"])
+
+    tmp_path = SETTINGS_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(validated, indent=2))
+    tmp_path.replace(SETTINGS_FILE)  # atomic on POSIX
+    return validated
 
 PAGE = """
 <!doctype html>
@@ -119,6 +183,17 @@ PAGE = """
   button:disabled {
     background: #93b4f0;
     cursor: default;
+  }
+  button.secondary {
+    background: transparent;
+    color: #2563eb;
+    border: 1px solid #2563eb;
+    margin-top: 8px;
+  }
+  button.secondary:disabled {
+    color: #93b4f0;
+    border-color: #93b4f0;
+    background: transparent;
   }
   #status {
     margin-top: 20px;
@@ -198,7 +273,7 @@ PAGE = """
   <label for="resolution">Resolution</label>
   <select id="resolution">
     {% for r in resolutions %}
-    <option value="{{ r }}">{{ r }}</option>
+    <option value="{{ r }}" {% if r == saved.resolution %}selected{% endif %}>{{ r }}</option>
     {% endfor %}
   </select>
 
@@ -208,28 +283,28 @@ PAGE = """
     <label for="top">Top</label>
     <div class="row">
       <input type="range" id="top" min="{{ specs.top.min }}" max="{{ specs.top.max }}"
-             step="{{ specs.top.step }}" value="{{ specs.top.default }}">
+             step="{{ specs.top.step }}" value="{{ saved.top }}">
       <span class="value" id="topVal"></span>
     </div>
 
     <label for="bottom">Bottom</label>
     <div class="row">
       <input type="range" id="bottom" min="{{ specs.bottom.min }}" max="{{ specs.bottom.max }}"
-             step="{{ specs.bottom.step }}" value="{{ specs.bottom.default }}">
+             step="{{ specs.bottom.step }}" value="{{ saved.bottom }}">
       <span class="value" id="bottomVal"></span>
     </div>
 
     <label for="left">Left</label>
     <div class="row">
       <input type="range" id="left" min="{{ specs.left.min }}" max="{{ specs.left.max }}"
-             step="{{ specs.left.step }}" value="{{ specs.left.default }}">
+             step="{{ specs.left.step }}" value="{{ saved.left }}">
       <span class="value" id="leftVal"></span>
     </div>
 
     <label for="right">Right</label>
     <div class="row">
       <input type="range" id="right" min="{{ specs.right.min }}" max="{{ specs.right.max }}"
-             step="{{ specs.right.step }}" value="{{ specs.right.default }}">
+             step="{{ specs.right.step }}" value="{{ saved.right }}">
       <span class="value" id="rightVal"></span>
     </div>
   </fieldset>
@@ -240,26 +315,27 @@ PAGE = """
     <label for="contrast">Contrast</label>
     <div class="row">
       <input type="range" id="contrast" min="{{ specs.contrast.min }}" max="{{ specs.contrast.max }}"
-             step="{{ specs.contrast.step }}" value="{{ specs.contrast.default }}">
+             step="{{ specs.contrast.step }}" value="{{ saved.contrast }}">
       <span class="value" id="contrastVal"></span>
     </div>
 
     <label for="saturation">Saturation</label>
     <div class="row">
       <input type="range" id="saturation" min="{{ specs.saturation.min }}" max="{{ specs.saturation.max }}"
-             step="{{ specs.saturation.step }}" value="{{ specs.saturation.default }}">
+             step="{{ specs.saturation.step }}" value="{{ saved.saturation }}">
       <span class="value" id="saturationVal"></span>
     </div>
 
     <label for="ev">EV compensation</label>
     <div class="row">
       <input type="range" id="ev" min="{{ specs.ev.min }}" max="{{ specs.ev.max }}"
-             step="{{ specs.ev.step }}" value="{{ specs.ev.default }}">
+             step="{{ specs.ev.step }}" value="{{ saved.ev }}">
       <span class="value" id="evVal"></span>
     </div>
   </fieldset>
 
   <button id="saveBtn">Save Picture</button>
+  <button id="saveDefaultsBtn" class="secondary">Save Current Settings as Default</button>
 
   <div id="status"></div>
   <img id="preview" alt="preview of last capture">
@@ -381,6 +457,47 @@ PAGE = """
     });
 
     loadGallery(0);
+
+    // ---- Save current slider/resolution values as the new startup defaults ----
+    const saveDefaultsBtn = document.getElementById('saveDefaultsBtn');
+    saveDefaultsBtn.addEventListener('click', async () => {
+      const payload = {
+        resolution: document.getElementById('resolution').value,
+        top: document.getElementById('top').value,
+        bottom: document.getElementById('bottom').value,
+        left: document.getElementById('left').value,
+        right: document.getElementById('right').value,
+        contrast: document.getElementById('contrast').value,
+        saturation: document.getElementById('saturation').value,
+        ev: document.getElementById('ev').value,
+      };
+
+      saveDefaultsBtn.disabled = true;
+      status.textContent = 'Saving defaults...';
+      status.className = '';
+
+      try {
+        const resp = await fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+
+        if (resp.ok && data.ok) {
+          status.textContent = 'Saved as default — these settings will load automatically next time.';
+          status.className = 'ok';
+        } else {
+          status.textContent = 'Error: ' + (data.error || 'unknown error');
+          status.className = 'err';
+        }
+      } catch (e) {
+        status.textContent = 'Error: ' + e;
+        status.className = 'err';
+      } finally {
+        saveDefaultsBtn.disabled = false;
+      }
+    });
   </script>
 </body>
 </html>
@@ -422,7 +539,8 @@ def _roi_from_margins(top, bottom, left, right):
 
 @app.route("/")
 def index():
-    return render_template_string(PAGE, resolutions=list(RESOLUTIONS.keys()), specs=PARAM_SPECS)
+    saved = load_settings()
+    return render_template_string(PAGE, resolutions=list(RESOLUTIONS.keys()), specs=PARAM_SPECS, saved=saved)
 
 
 @app.route("/save", methods=["POST"])
@@ -431,20 +549,21 @@ def save_picture():
         return jsonify(ok=False, error="No camera CLI found (rpicam-still / libcamera-still)."), 500
 
     data = request.get_json(silent=True) or {}
+    defaults = load_settings()
 
-    resolution = data.get("resolution")
+    resolution = data.get("resolution", defaults["resolution"])
     if resolution not in RESOLUTIONS:
         return jsonify(ok=False, error=f"Unknown resolution '{resolution}'."), 400
     width, height = RESOLUTIONS[resolution]
 
     try:
-        top = _validate_range("top", data.get("top", PARAM_SPECS["top"]["default"]), PARAM_SPECS["top"])
-        bottom = _validate_range("bottom", data.get("bottom", PARAM_SPECS["bottom"]["default"]), PARAM_SPECS["bottom"])
-        left = _validate_range("left", data.get("left", PARAM_SPECS["left"]["default"]), PARAM_SPECS["left"])
-        right = _validate_range("right", data.get("right", PARAM_SPECS["right"]["default"]), PARAM_SPECS["right"])
-        contrast = _validate_range("contrast", data.get("contrast", PARAM_SPECS["contrast"]["default"]), PARAM_SPECS["contrast"])
-        saturation = _validate_range("saturation", data.get("saturation", PARAM_SPECS["saturation"]["default"]), PARAM_SPECS["saturation"])
-        ev = _validate_range("ev", data.get("ev", PARAM_SPECS["ev"]["default"]), PARAM_SPECS["ev"])
+        top = _validate_range("top", data.get("top", defaults["top"]), PARAM_SPECS["top"])
+        bottom = _validate_range("bottom", data.get("bottom", defaults["bottom"]), PARAM_SPECS["bottom"])
+        left = _validate_range("left", data.get("left", defaults["left"]), PARAM_SPECS["left"])
+        right = _validate_range("right", data.get("right", defaults["right"]), PARAM_SPECS["right"])
+        contrast = _validate_range("contrast", data.get("contrast", defaults["contrast"]), PARAM_SPECS["contrast"])
+        saturation = _validate_range("saturation", data.get("saturation", defaults["saturation"]), PARAM_SPECS["saturation"])
+        ev = _validate_range("ev", data.get("ev", defaults["ev"]), PARAM_SPECS["ev"])
         roi = _roi_from_margins(top, bottom, left, right)
     except ValueError as e:
         return jsonify(ok=False, error=str(e)), 400
@@ -523,6 +642,21 @@ def list_photos():
         total=total,
         has_more=(offset + limit) < total,
     )
+
+
+@app.route("/settings", methods=["GET"])
+def get_settings():
+    return jsonify(ok=True, settings=load_settings())
+
+
+@app.route("/settings", methods=["POST"])
+def update_settings():
+    data = request.get_json(silent=True) or {}
+    try:
+        validated = save_settings(data)
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 400
+    return jsonify(ok=True, settings=validated)
 
 
 @app.route("/preview/<filename>")
