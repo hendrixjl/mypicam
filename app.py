@@ -3,6 +3,7 @@
 Simple web GUI to capture a still photo from the Raspberry Pi camera.
 
 - Dropdown to pick a resolution
+- Sliders for zoom/crop (ROI), contrast, saturation, and EV compensation
 - "Save Picture" button that triggers a capture on the server side
 - Uses the current `rpicam-still` CLI (Bookworm/Trixie), falling back to the
   older `libcamera-still` name if that's what's installed.
@@ -18,7 +19,7 @@ import subprocess
 import datetime
 from pathlib import Path
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
 
 app = Flask(__name__)
 
@@ -34,7 +35,16 @@ RESOLUTIONS = {
     "3280x2464": (3280, 2464),
 }
 
-
+# Slider bounds + defaults for the adjustable capture parameters.
+# (rpicam-still technically accepts wider contrast/saturation ranges up to
+# 32.0 and ev up to +/-10.0, but those extremes aren't useful in practice —
+# these bounds keep the sliders in a sensible, well-behaved range.)
+PARAM_SPECS = {
+    "zoom":       {"min": 10,   "max": 100,  "default": 50,   "step": 5},    # % of frame kept, centered
+    "contrast":   {"min": 0.0,  "max": 3.0,  "default": 1.3,  "step": 0.1},
+    "saturation": {"min": 0.0,  "max": 3.0,  "default": 1.3,  "step": 0.1},
+    "ev":         {"min": -3.0, "max": 3.0,  "default": -0.3, "step": 0.1},
+}
 
 # Prefer the current command name; fall back to the legacy one.
 CAMERA_CMD = shutil.which("rpicam-still") or shutil.which("libcamera-still")
@@ -53,13 +63,25 @@ PAGE = """
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     max-width: 480px;
-    margin: 60px auto;
+    margin: 40px auto;
     padding: 0 20px;
     text-align: center;
   }
   h1 {
     font-size: 1.4rem;
     margin-bottom: 1.5rem;
+  }
+  label {
+    display: block;
+    text-align: left;
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin-top: 14px;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
   select, button {
     font-size: 1.05rem;
@@ -70,12 +92,23 @@ PAGE = """
     width: 100%;
     box-sizing: border-box;
   }
+  input[type="range"] {
+    flex: 1;
+  }
+  .value {
+    min-width: 3.5em;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.9rem;
+    opacity: 0.8;
+  }
   button {
     background: #2563eb;
     color: white;
     border: none;
     cursor: pointer;
     font-weight: 600;
+    margin-top: 20px;
   }
   button:disabled {
     background: #93b4f0;
@@ -94,6 +127,16 @@ PAGE = """
     border-radius: 8px;
     display: none;
   }
+  fieldset {
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    margin-top: 20px;
+    padding: 4px 14px 14px;
+  }
+  legend {
+    font-size: 0.85rem;
+    opacity: 0.75;
+  }
 </style>
 </head>
 <body>
@@ -106,6 +149,38 @@ PAGE = """
     {% endfor %}
   </select>
 
+  <fieldset>
+    <legend>Adjustments</legend>
+
+    <label for="zoom">Zoom / crop (% of frame kept, centered)</label>
+    <div class="row">
+      <input type="range" id="zoom" min="{{ specs.zoom.min }}" max="{{ specs.zoom.max }}"
+             step="{{ specs.zoom.step }}" value="{{ specs.zoom.default }}">
+      <span class="value" id="zoomVal"></span>
+    </div>
+
+    <label for="contrast">Contrast</label>
+    <div class="row">
+      <input type="range" id="contrast" min="{{ specs.contrast.min }}" max="{{ specs.contrast.max }}"
+             step="{{ specs.contrast.step }}" value="{{ specs.contrast.default }}">
+      <span class="value" id="contrastVal"></span>
+    </div>
+
+    <label for="saturation">Saturation</label>
+    <div class="row">
+      <input type="range" id="saturation" min="{{ specs.saturation.min }}" max="{{ specs.saturation.max }}"
+             step="{{ specs.saturation.step }}" value="{{ specs.saturation.default }}">
+      <span class="value" id="saturationVal"></span>
+    </div>
+
+    <label for="ev">EV compensation</label>
+    <div class="row">
+      <input type="range" id="ev" min="{{ specs.ev.min }}" max="{{ specs.ev.max }}"
+             step="{{ specs.ev.step }}" value="{{ specs.ev.default }}">
+      <span class="value" id="evVal"></span>
+    </div>
+  </fieldset>
+
   <button id="saveBtn">Save Picture</button>
 
   <div id="status"></div>
@@ -116,8 +191,25 @@ PAGE = """
     const status = document.getElementById('status');
     const preview = document.getElementById('preview');
 
+    // Wire up each slider to live-update its displayed value.
+    const sliderIds = ['zoom', 'contrast', 'saturation', 'ev'];
+    for (const id of sliderIds) {
+      const slider = document.getElementById(id);
+      const valSpan = document.getElementById(id + 'Val');
+      const update = () => {
+        valSpan.textContent = id === 'zoom' ? slider.value + '%' : slider.value;
+      };
+      slider.addEventListener('input', update);
+      update();
+    }
+
     btn.addEventListener('click', async () => {
       const resolution = document.getElementById('resolution').value;
+      const zoom = document.getElementById('zoom').value;
+      const contrast = document.getElementById('contrast').value;
+      const saturation = document.getElementById('saturation').value;
+      const ev = document.getElementById('ev').value;
+
       btn.disabled = true;
       status.textContent = 'Capturing...';
       status.className = '';
@@ -127,7 +219,7 @@ PAGE = """
         const resp = await fetch('/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resolution })
+          body: JSON.stringify({ resolution, zoom, contrast, saturation, ev })
         });
         const data = await resp.json();
 
@@ -153,9 +245,33 @@ PAGE = """
 """
 
 
+def _validate_range(name, value, spec):
+    """Coerce to float and clamp/validate against the slider's min/max."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{name}' must be a number.")
+    if not (spec["min"] <= value <= spec["max"]):
+        raise ValueError(f"'{name}' must be between {spec['min']} and {spec['max']}.")
+    return value
+
+
+def _roi_from_zoom(zoom_percent):
+    """
+    Convert a 'percent of frame kept, centered' zoom value into an
+    rpicam-still --roi string 'x,y,w,h' (fractions 0-1).
+
+    zoom_percent=100 -> full frame (0,0,1,1)
+    zoom_percent=50  -> centered crop keeping 50% width/height (2x zoom)
+    """
+    frac = zoom_percent / 100.0
+    offset = (1.0 - frac) / 2.0
+    return f"{offset:.3f},{offset:.3f},{frac:.3f},{frac:.3f}"
+
+
 @app.route("/")
 def index():
-    return render_template_string(PAGE, resolutions=list(RESOLUTIONS.keys()))
+    return render_template_string(PAGE, resolutions=list(RESOLUTIONS.keys()), specs=PARAM_SPECS)
 
 
 @app.route("/save", methods=["POST"])
@@ -164,11 +280,22 @@ def save_picture():
         return jsonify(ok=False, error="No camera CLI found (rpicam-still / libcamera-still)."), 500
 
     data = request.get_json(silent=True) or {}
+
     resolution = data.get("resolution")
     if resolution not in RESOLUTIONS:
         return jsonify(ok=False, error=f"Unknown resolution '{resolution}'."), 400
-
     width, height = RESOLUTIONS[resolution]
+
+    try:
+        zoom = _validate_range("zoom", data.get("zoom", PARAM_SPECS["zoom"]["default"]), PARAM_SPECS["zoom"])
+        contrast = _validate_range("contrast", data.get("contrast", PARAM_SPECS["contrast"]["default"]), PARAM_SPECS["contrast"])
+        saturation = _validate_range("saturation", data.get("saturation", PARAM_SPECS["saturation"]["default"]), PARAM_SPECS["saturation"])
+        ev = _validate_range("ev", data.get("ev", PARAM_SPECS["ev"]["default"]), PARAM_SPECS["ev"])
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 400
+
+    roi = _roi_from_zoom(zoom)
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"capture_{resolution}_{timestamp}.jpg"
     output_path = PICTURES_DIR / filename
@@ -179,12 +306,12 @@ def save_picture():
         "--height", str(height),
         "--autofocus-mode", "auto",
         "--autofocus-range", "macro",
-        "--roi", ".25,0.25,0.5,0.5",
+        "--roi", roi,
+        "--contrast", f"{contrast:.2f}",
+        "--saturation", f"{saturation:.2f}",
+        "--ev", f"{ev:.2f}",
+        "--metering", "spot",
         "--output", str(output_path),
-        "--contrast", "1.3",
-         "--saturation", "1.3",
-         "--ev", "-0.3",
-         "--metering", "spot",
         "--timeout", "1000",   # ms of preview before capture
         "--nopreview",
     ]
@@ -201,12 +328,11 @@ def save_picture():
     if result.returncode != 0 or not output_path.exists():
         return jsonify(ok=False, error=result.stderr.strip() or "Capture failed."), 500
 
-    return jsonify(ok=True, filename=filename, path=str(output_path))
+    return jsonify(ok=True, filename=filename, path=str(output_path), roi=roi)
 
 
 @app.route("/preview/<filename>")
 def preview(filename):
-    from flask import send_from_directory
     return send_from_directory(PICTURES_DIR, filename)
 
 
