@@ -34,6 +34,8 @@ RESOLUTIONS = {
     "3280x2464": (3280, 2464),
 }
 
+
+
 # Prefer the current command name; fall back to the legacy one.
 CAMERA_CMD = shutil.which("rpicam-still") or shutil.which("libcamera-still")
 
@@ -177,6 +179,7 @@ def save_picture():
         "--height", str(height),
         "--autofocus-mode", "auto",
         "--autofocus-range", "macro",
+        "--roi", ".25,0.25,0.5,0.5",
         "--output", str(output_path),
         "--timeout", "1000",   # ms of preview before capture
         "--nopreview",
