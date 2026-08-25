@@ -143,6 +143,53 @@ PAGE = """
     font-size: 0.85rem;
     opacity: 0.75;
   }
+  h2 {
+    font-size: 1.1rem;
+    margin: 30px 0 10px;
+    text-align: left;
+  }
+  #gallery {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+  .thumb {
+    cursor: pointer;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #0000000d;
+  }
+  .thumb img {
+    width: 100%;
+    height: 110px;
+    object-fit: cover;
+    display: block;
+  }
+  .thumb .cap {
+    font-size: 0.7rem;
+    padding: 4px 6px;
+    opacity: 0.7;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .galleryNav {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .galleryNav button {
+    margin: 0;
+    width: auto;
+    flex: 1;
+  }
+  #galleryEmpty {
+    font-size: 0.9rem;
+    opacity: 0.7;
+    margin-top: 10px;
+  }
 </style>
 </head>
 <body>
@@ -217,6 +264,14 @@ PAGE = """
   <div id="status"></div>
   <img id="preview" alt="preview of last capture">
 
+  <h2>Past Pictures</h2>
+  <div id="gallery"></div>
+  <div id="galleryEmpty" style="display:none;">No pictures yet.</div>
+  <div class="galleryNav">
+    <button id="newerBtn" disabled>&laquo; Newer</button>
+    <button id="olderBtn" disabled>Older &raquo;</button>
+  </div>
+
   <script>
     const btn = document.getElementById('saveBtn');
     const status = document.getElementById('status');
@@ -274,6 +329,58 @@ PAGE = """
         btn.disabled = false;
       }
     });
+
+    // ---- Past pictures gallery (10 at a time, most recent first) ----
+    const GALLERY_PAGE_SIZE = 10;
+    let galleryOffset = 0;
+
+    const galleryEl = document.getElementById('gallery');
+    const galleryEmptyEl = document.getElementById('galleryEmpty');
+    const newerBtn = document.getElementById('newerBtn');
+    const olderBtn = document.getElementById('olderBtn');
+
+    async function loadGallery(offset) {
+      const resp = await fetch('/photos?offset=' + offset + '&limit=' + GALLERY_PAGE_SIZE);
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) return;
+
+      galleryOffset = data.offset;
+      galleryEl.innerHTML = '';
+
+      galleryEmptyEl.style.display = (data.photos.length === 0 && galleryOffset === 0) ? 'block' : 'none';
+
+      for (const photo of data.photos) {
+        const div = document.createElement('div');
+        div.className = 'thumb';
+        const img = document.createElement('img');
+        img.src = '/preview/' + photo.filename;
+        img.loading = 'lazy';
+        img.alt = photo.filename;
+        const cap = document.createElement('div');
+        cap.className = 'cap';
+        cap.textContent = photo.filename;
+        div.appendChild(img);
+        div.appendChild(cap);
+        div.addEventListener('click', () => {
+          preview.src = '/preview/' + photo.filename + '?t=' + Date.now();
+          preview.style.display = 'block';
+          preview.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+        galleryEl.appendChild(div);
+      }
+
+      newerBtn.disabled = galleryOffset <= 0;
+      olderBtn.disabled = !data.has_more;
+    }
+
+    newerBtn.addEventListener('click', () => {
+      loadGallery(Math.max(0, galleryOffset - GALLERY_PAGE_SIZE));
+    });
+    olderBtn.addEventListener('click', () => {
+      loadGallery(galleryOffset + GALLERY_PAGE_SIZE);
+    });
+
+    loadGallery(0);
   </script>
 </body>
 </html>
@@ -375,6 +482,47 @@ def save_picture():
         return jsonify(ok=False, error=result.stderr.strip() or "Capture failed."), 500
 
     return jsonify(ok=True, filename=filename, path=str(output_path), roi=roi)
+
+
+GALLERY_PAGE_SIZE_DEFAULT = 10
+GALLERY_PAGE_SIZE_MAX = 50
+
+
+@app.route("/photos")
+def list_photos():
+    """
+    List past captures, most recent first, paginated via ?offset=&limit=.
+    """
+    try:
+        offset = int(request.args.get("offset", 0))
+        limit = int(request.args.get("limit", GALLERY_PAGE_SIZE_DEFAULT))
+    except ValueError:
+        return jsonify(ok=False, error="'offset' and 'limit' must be integers."), 400
+
+    if offset < 0:
+        return jsonify(ok=False, error="'offset' must be >= 0."), 400
+    if not (1 <= limit <= GALLERY_PAGE_SIZE_MAX):
+        return jsonify(ok=False, error=f"'limit' must be between 1 and {GALLERY_PAGE_SIZE_MAX}."), 400
+
+    files = [f for f in PICTURES_DIR.iterdir() if f.is_file()]
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)  # most recent first
+
+    total = len(files)
+    page = files[offset:offset + limit]
+
+    photos = [
+        {"filename": f.name, "modified": datetime.datetime.fromtimestamp(f.stat().st_mtime).isoformat()}
+        for f in page
+    ]
+
+    return jsonify(
+        ok=True,
+        photos=photos,
+        offset=offset,
+        limit=limit,
+        total=total,
+        has_more=(offset + limit) < total,
+    )
 
 
 @app.route("/preview/<filename>")
