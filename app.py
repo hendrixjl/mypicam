@@ -39,8 +39,14 @@ RESOLUTIONS = {
 # (rpicam-still technically accepts wider contrast/saturation ranges up to
 # 32.0 and ev up to +/-10.0, but those extremes aren't useful in practice —
 # these bounds keep the sliders in a sensible, well-behaved range.)
+#
+# left/right/top/bottom are independent crop margins, each as a percentage
+# of the frame to trim from that edge (0 = no crop on that edge).
 PARAM_SPECS = {
-    "zoom":       {"min": 10,   "max": 100,  "default": 50,   "step": 5},    # % of frame kept, centered
+    "left":       {"min": 0,    "max": 90,   "default": 25,   "step": 5},
+    "right":      {"min": 0,    "max": 90,   "default": 25,   "step": 5},
+    "top":        {"min": 0,    "max": 90,   "default": 25,   "step": 5},
+    "bottom":     {"min": 0,    "max": 90,   "default": 25,   "step": 5},
     "contrast":   {"min": 0.0,  "max": 3.0,  "default": 1.3,  "step": 0.1},
     "saturation": {"min": 0.0,  "max": 3.0,  "default": 1.3,  "step": 0.1},
     "ev":         {"min": -3.0, "max": 3.0,  "default": -0.3, "step": 0.1},
@@ -150,14 +156,39 @@ PAGE = """
   </select>
 
   <fieldset>
-    <legend>Adjustments</legend>
+    <legend>Crop margins (% trimmed from each edge)</legend>
 
-    <label for="zoom">Zoom / crop (% of frame kept, centered)</label>
+    <label for="top">Top</label>
     <div class="row">
-      <input type="range" id="zoom" min="{{ specs.zoom.min }}" max="{{ specs.zoom.max }}"
-             step="{{ specs.zoom.step }}" value="{{ specs.zoom.default }}">
-      <span class="value" id="zoomVal"></span>
+      <input type="range" id="top" min="{{ specs.top.min }}" max="{{ specs.top.max }}"
+             step="{{ specs.top.step }}" value="{{ specs.top.default }}">
+      <span class="value" id="topVal"></span>
     </div>
+
+    <label for="bottom">Bottom</label>
+    <div class="row">
+      <input type="range" id="bottom" min="{{ specs.bottom.min }}" max="{{ specs.bottom.max }}"
+             step="{{ specs.bottom.step }}" value="{{ specs.bottom.default }}">
+      <span class="value" id="bottomVal"></span>
+    </div>
+
+    <label for="left">Left</label>
+    <div class="row">
+      <input type="range" id="left" min="{{ specs.left.min }}" max="{{ specs.left.max }}"
+             step="{{ specs.left.step }}" value="{{ specs.left.default }}">
+      <span class="value" id="leftVal"></span>
+    </div>
+
+    <label for="right">Right</label>
+    <div class="row">
+      <input type="range" id="right" min="{{ specs.right.min }}" max="{{ specs.right.max }}"
+             step="{{ specs.right.step }}" value="{{ specs.right.default }}">
+      <span class="value" id="rightVal"></span>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Adjustments</legend>
 
     <label for="contrast">Contrast</label>
     <div class="row">
@@ -192,12 +223,13 @@ PAGE = """
     const preview = document.getElementById('preview');
 
     // Wire up each slider to live-update its displayed value.
-    const sliderIds = ['zoom', 'contrast', 'saturation', 'ev'];
-    for (const id of sliderIds) {
+    const marginIds = ['top', 'bottom', 'left', 'right'];
+    const otherIds = ['contrast', 'saturation', 'ev'];
+    for (const id of [...marginIds, ...otherIds]) {
       const slider = document.getElementById(id);
       const valSpan = document.getElementById(id + 'Val');
       const update = () => {
-        valSpan.textContent = id === 'zoom' ? slider.value + '%' : slider.value;
+        valSpan.textContent = marginIds.includes(id) ? slider.value + '%' : slider.value;
       };
       slider.addEventListener('input', update);
       update();
@@ -205,7 +237,10 @@ PAGE = """
 
     btn.addEventListener('click', async () => {
       const resolution = document.getElementById('resolution').value;
-      const zoom = document.getElementById('zoom').value;
+      const top = document.getElementById('top').value;
+      const bottom = document.getElementById('bottom').value;
+      const left = document.getElementById('left').value;
+      const right = document.getElementById('right').value;
       const contrast = document.getElementById('contrast').value;
       const saturation = document.getElementById('saturation').value;
       const ev = document.getElementById('ev').value;
@@ -219,7 +254,7 @@ PAGE = """
         const resp = await fetch('/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resolution, zoom, contrast, saturation, ev })
+          body: JSON.stringify({ resolution, top, bottom, left, right, contrast, saturation, ev })
         });
         const data = await resp.json();
 
@@ -256,17 +291,26 @@ def _validate_range(name, value, spec):
     return value
 
 
-def _roi_from_zoom(zoom_percent):
+def _roi_from_margins(top, bottom, left, right):
     """
-    Convert a 'percent of frame kept, centered' zoom value into an
-    rpicam-still --roi string 'x,y,w,h' (fractions 0-1).
+    Convert independent top/bottom/left/right crop margins (each a percent
+    of the frame to trim from that edge) into an rpicam-still --roi string
+    'x,y,w,h' (fractions 0-1).
 
-    zoom_percent=100 -> full frame (0,0,1,1)
-    zoom_percent=50  -> centered crop keeping 50% width/height (2x zoom)
+    All-zero margins -> full frame (0,0,1,1).
     """
-    frac = zoom_percent / 100.0
-    offset = (1.0 - frac) / 2.0
-    return f"{offset:.3f},{offset:.3f},{frac:.3f},{frac:.3f}"
+    top_f, bottom_f, left_f, right_f = (v / 100.0 for v in (top, bottom, left, right))
+
+    if left_f + right_f >= 1.0:
+        raise ValueError("'left' + 'right' must be less than 100%.")
+    if top_f + bottom_f >= 1.0:
+        raise ValueError("'top' + 'bottom' must be less than 100%.")
+
+    x = left_f
+    y = top_f
+    w = 1.0 - left_f - right_f
+    h = 1.0 - top_f - bottom_f
+    return f"{x:.3f},{y:.3f},{w:.3f},{h:.3f}"
 
 
 @app.route("/")
@@ -287,14 +331,16 @@ def save_picture():
     width, height = RESOLUTIONS[resolution]
 
     try:
-        zoom = _validate_range("zoom", data.get("zoom", PARAM_SPECS["zoom"]["default"]), PARAM_SPECS["zoom"])
+        top = _validate_range("top", data.get("top", PARAM_SPECS["top"]["default"]), PARAM_SPECS["top"])
+        bottom = _validate_range("bottom", data.get("bottom", PARAM_SPECS["bottom"]["default"]), PARAM_SPECS["bottom"])
+        left = _validate_range("left", data.get("left", PARAM_SPECS["left"]["default"]), PARAM_SPECS["left"])
+        right = _validate_range("right", data.get("right", PARAM_SPECS["right"]["default"]), PARAM_SPECS["right"])
         contrast = _validate_range("contrast", data.get("contrast", PARAM_SPECS["contrast"]["default"]), PARAM_SPECS["contrast"])
         saturation = _validate_range("saturation", data.get("saturation", PARAM_SPECS["saturation"]["default"]), PARAM_SPECS["saturation"])
         ev = _validate_range("ev", data.get("ev", PARAM_SPECS["ev"]["default"]), PARAM_SPECS["ev"])
+        roi = _roi_from_margins(top, bottom, left, right)
     except ValueError as e:
         return jsonify(ok=False, error=str(e)), 400
-
-    roi = _roi_from_zoom(zoom)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"capture_{resolution}_{timestamp}.jpg"
