@@ -175,6 +175,8 @@ def save_picture():
         CAMERA_CMD,
         "--width", str(width),
         "--height", str(height),
+        "--autofocus-mode", "auto",
+        "--autofocus-range", "macro",
         "--output", str(output_path),
         "--timeout", "1000",   # ms of preview before capture
         "--nopreview",
