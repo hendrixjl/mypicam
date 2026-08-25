@@ -181,6 +181,10 @@ def save_picture():
         "--autofocus-range", "macro",
         "--roi", ".25,0.25,0.5,0.5",
         "--output", str(output_path),
+        "--contrast", "1.3",
+         "--saturation", "1.3",
+         "--ev", "-0.3",
+         "--metering", "spot",
         "--timeout", "1000",   # ms of preview before capture
         "--nopreview",
     ]
