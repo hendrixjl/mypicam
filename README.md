@@ -3,6 +3,8 @@
 A minimal Flask app with:
 - A resolution dropdown: 640x480, 1640x1232, 1920x1080, 3280x2464
 - A "Save Picture" button that triggers a capture
+- A background motion-detection mode for unattended bird-feeder monitoring
+  that starts automatically and auto-saves photos when something changes
 
 ## How it works
 
@@ -16,14 +18,16 @@ timestamp filename, and the page shows a preview of the last shot.
 ## Setup on the Raspberry Pi
 
 1. Copy this folder to the Pi (e.g. via `scp` or a USB drive).
-2. Make sure the camera CLI tools are installed (they're included by default
-   on current Raspberry Pi OS):
+2. Make sure the camera CLI tools and Python dependencies are installed
+   (rpicam-apps and Flask are included by default on current Raspberry Pi
+   OS; Pillow and NumPy are needed for motion detection):
    ```bash
    sudo apt update
-   sudo apt install -y rpicam-apps python3-flask
+   sudo apt install -y rpicam-apps python3-flask python3-pil python3-numpy
    ```
-   (If `python3-flask` isn't available via apt on your OS version, use
-   `pip3 install flask --break-system-packages` or a virtualenv instead.)
+   (If a package isn't available via apt on your OS version, use
+   `pip3 install flask pillow numpy --break-system-packages` or a
+   virtualenv instead.)
 3. Confirm the camera itself works first:
    ```bash
    rpicam-hello --list-cameras
@@ -96,6 +100,59 @@ over HTTPS with no credentials. If your repo is private, set up a
 [deploy key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)
 or a GitHub personal access token stored via `git credential-store`, so
 `git pull` can run unattended without a password prompt.
+
+## Motion detection (automatic bird-feeder capture)
+
+The app includes a background motion-detection mode built for exactly this
+use case: watching a bird feeder unattended. It starts automatically
+whenever `app.py` runs — no button press needed — including every time the
+systemd service (re)starts, so a reboot or `git pull` update brings it
+right back up.
+
+**How it works:** every couple of seconds, the app grabs a small snapshot
+of the same feeder area framed by the crop-margin sliders, compares it
+against a running background image, and — once enough of the frame has
+changed for a couple of checks in a row — saves a full-resolution photo the
+same way the "Save Picture" button does. Auto-captured photos are named
+`motion_<resolution>_<timestamp>.jpg` (vs. `capture_...` for manual shots)
+and show up in the same "Past Pictures" gallery, tagged "· auto".
+
+**Controls (on the web page):**
+- **Enable automatic capture** — toggle motion detection on/off at any
+  time, no restart needed.
+- **Sensitivity** (1–10) — how much change is needed to count as motion.
+  Higher = triggers more easily (good for small birds); lower = ignores
+  more background noise (wind, shadows, leaves).
+- **Cooldown between auto-captures** (5–120s) — minimum time between two
+  automatic photos, so one visiting bird doesn't fill the gallery with
+  near-duplicate shots.
+
+Motion detection re-uses whatever crop margins and contrast/saturation/EV
+values are currently the saved defaults, so frame the feeder tightly with
+those sliders first (use "Save Current Settings as Default" to lock them
+in) — a tight crop on just the feeder is the single biggest factor in
+avoiding false triggers from background movement.
+
+**Extra dependency:** motion detection needs Pillow and NumPy on the Pi
+(see the apt command in "Setup" above). If they're missing, the app still
+runs fine — the manual "Save Picture" button keeps working, and the web
+page shows a note that automatic capture is unavailable until those
+packages are installed and the app is restarted.
+
+**Tuning tips:**
+
+| Symptom | Adjustment |
+|---|---|
+| Triggers on wind/shadows/leaves | Tighten the crop margins; lower Sensitivity |
+| Misses small/quick birds | Raise Sensitivity |
+| Too many near-duplicate photos | Raise the Cooldown |
+| Never seems to fire | Check `journalctl -u pi-camera-gui.service -f` for `[motion]` log lines — this shows poll results and any capture errors |
+
+**Note on camera sharing:** manual captures and automatic motion captures
+share the same physical camera and are serialized internally, so they
+never conflict with each other — but a manual "Save Picture" click may
+wait up to a second or two if it lands in the middle of a motion-detection
+poll.
 
 ## Notes
 

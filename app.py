@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-Simple web GUI to capture a still photo from the Raspberry Pi camera.
+Web GUI to capture still photos from the Raspberry Pi camera, plus an
+automatic motion-detection mode for unattended bird-feeder monitoring.
 
 - Dropdown to pick a resolution
 - Sliders for zoom/crop (ROI), contrast, saturation, and EV compensation
-- "Save Picture" button that triggers a capture on the server side
+- "Save Picture" button that triggers a manual capture on the server side
+- A background thread that watches the feeder area and automatically saves
+  a full-resolution photo whenever something changes, no button press
+  needed. It starts automatically as soon as this script runs (including
+  on boot, via the systemd service), and can be paused/resumed from the
+  web page without restarting anything.
 - Uses the current `rpicam-still` CLI (Bookworm/Trixie), falling back to the
   older `libcamera-still` name if that's what's installed.
 
@@ -14,13 +20,23 @@ Then browse to:
     http://<pi-ip-address>:5000
 """
 
+import datetime
 import json
 import shutil
 import subprocess
-import datetime
+import tempfile
+import threading
+import time
 from pathlib import Path
 
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
+
+try:
+    import numpy as np
+    from PIL import Image, ImageFilter
+    _MOTION_DEPS_AVAILABLE = True
+except ImportError:
+    _MOTION_DEPS_AVAILABLE = False
 
 app = Flask(__name__)
 
@@ -53,18 +69,37 @@ PARAM_SPECS = {
     "ev":         {"min": -3.0, "max": 3.0,  "default": -0.3, "step": 0.1},
 }
 
+# Motion-detection tuning exposed in the UI. "Sensitivity" is a simplified
+# 1-10 dial: higher = triggers on smaller amounts of change. "Cooldown" is
+# the minimum time between two automatic captures, so one visiting bird
+# doesn't fill the gallery with near-duplicate photos.
+MOTION_SPECS = {
+    "motion_sensitivity": {"min": 1, "max": 10, "default": 5, "step": 1},
+    "motion_cooldown":    {"min": 5, "max": 120, "default": 20, "step": 5},
+}
+
+ALL_NUMERIC_SPECS = {**PARAM_SPECS, **MOTION_SPECS}
+
 # Prefer the current command name; fall back to the legacy one.
 CAMERA_CMD = shutil.which("rpicam-still") or shutil.which("libcamera-still")
 
-# Persisted "defaults" (resolution + slider values) so the last-saved settings
-# are reloaded automatically the next time the app starts. Kept alongside
-# app.py but NOT meant to be committed to git (add it to .gitignore) since
-# it's per-device/user state, not code.
+# Serializes all camera CLI invocations (manual captures, motion-detection
+# polling snapshots, and motion-triggered captures) so only one process
+# ever touches the camera at a time.
+CAMERA_LOCK = threading.Lock()
+
+# Persisted "defaults" (resolution + slider values + motion-detection
+# settings) so the last-saved settings are reloaded automatically the next
+# time the app starts. Kept alongside app.py but NOT meant to be committed
+# to git (see .gitignore) since it's per-device/user state, not code.
 SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
 
 BUILTIN_DEFAULTS = {
     "resolution": next(iter(RESOLUTIONS)),
-    **{key: spec["default"] for key, spec in PARAM_SPECS.items()},
+    **{key: spec["default"] for key, spec in ALL_NUMERIC_SPECS.items()},
+    # Motion detection is on by default so a freshly set-up Pi starts
+    # monitoring the feeder automatically without any extra steps.
+    "motion_enabled": True,
 }
 
 
@@ -90,25 +125,44 @@ def load_settings():
     if saved.get("resolution") in RESOLUTIONS:
         settings["resolution"] = saved["resolution"]
 
-    for key in PARAM_SPECS:
+    for key, spec in ALL_NUMERIC_SPECS.items():
         if key in saved:
             try:
-                settings[key] = _validate_range(key, saved[key], PARAM_SPECS[key])
+                settings[key] = _validate_range(key, saved[key], spec)
             except ValueError:
                 pass  # keep the built-in default for this one field
+
+    if "motion_enabled" in saved:
+        settings["motion_enabled"] = bool(saved["motion_enabled"])
 
     return settings
 
 
 def save_settings(data):
-    """Validate incoming settings and atomically persist them to disk."""
-    resolution = data.get("resolution")
-    if resolution not in RESOLUTIONS:
-        raise ValueError(f"Unknown resolution '{resolution}'.")
+    """
+    Merge incoming fields with the currently saved settings, validate the
+    result, and atomically persist it. Merging (rather than requiring a
+    full payload) lets the motion-detection toggle/sliders save themselves
+    immediately without needing to resend the capture resolution/crop/etc.
+    """
+    current = load_settings()
+    merged = dict(current)
 
-    validated = {"resolution": resolution}
-    for key in PARAM_SPECS:
-        validated[key] = _validate_range(key, data.get(key, PARAM_SPECS[key]["default"]), PARAM_SPECS[key])
+    if "resolution" in data:
+        merged["resolution"] = data["resolution"]
+    for key in ALL_NUMERIC_SPECS:
+        if key in data:
+            merged[key] = data[key]
+    if "motion_enabled" in data:
+        merged["motion_enabled"] = data["motion_enabled"]
+
+    if merged.get("resolution") not in RESOLUTIONS:
+        raise ValueError(f"Unknown resolution '{merged.get('resolution')}'.")
+
+    validated = {"resolution": merged["resolution"]}
+    for key, spec in ALL_NUMERIC_SPECS.items():
+        validated[key] = _validate_range(key, merged.get(key, spec["default"]), spec)
+    validated["motion_enabled"] = bool(merged.get("motion_enabled", True))
 
     # Reuses the same crop-margin validation as an actual capture, so an
     # invalid combination (e.g. left + right >= 100%) is rejected here too.
@@ -265,6 +319,25 @@ PAGE = """
     opacity: 0.7;
     margin-top: 10px;
   }
+  #motionStatus {
+    font-size: 0.85rem;
+    opacity: 0.8;
+    margin-top: 8px;
+    text-align: left;
+  }
+  .motionWarning {
+    color: #dc2626;
+    font-size: 0.85rem;
+    text-align: left;
+  }
+  .toggleRow {
+    align-items: center;
+    justify-content: space-between;
+  }
+  .toggleRow input[type="checkbox"] {
+    width: auto;
+    transform: scale(1.3);
+  }
 </style>
 </head>
 <body>
@@ -334,6 +407,42 @@ PAGE = """
     </div>
   </fieldset>
 
+  <fieldset>
+    <legend>Motion Detection (bird-feeder auto-capture)</legend>
+
+    {% if not motion_deps_available %}
+    <p class="motionWarning">
+      Motion detection needs the Pillow and NumPy packages on the Pi.
+      Install with:<br><code>sudo apt install -y python3-pil python3-numpy</code>,
+      then restart the app.
+    </p>
+    {% endif %}
+
+    <label for="motionEnabled" class="row toggleRow">
+      <span>Enable automatic capture</span>
+      <input type="checkbox" id="motionEnabled" {% if saved.motion_enabled %}checked{% endif %}
+             {% if not motion_deps_available %}disabled{% endif %}>
+    </label>
+
+    <label for="motionSensitivity">Sensitivity</label>
+    <div class="row">
+      <input type="range" id="motionSensitivity" min="{{ motion_specs.motion_sensitivity.min }}"
+             max="{{ motion_specs.motion_sensitivity.max }}" step="{{ motion_specs.motion_sensitivity.step }}"
+             value="{{ saved.motion_sensitivity }}" {% if not motion_deps_available %}disabled{% endif %}>
+      <span class="value" id="motionSensitivityVal"></span>
+    </div>
+
+    <label for="motionCooldown">Cooldown between auto-captures (seconds)</label>
+    <div class="row">
+      <input type="range" id="motionCooldown" min="{{ motion_specs.motion_cooldown.min }}"
+             max="{{ motion_specs.motion_cooldown.max }}" step="{{ motion_specs.motion_cooldown.step }}"
+             value="{{ saved.motion_cooldown }}" {% if not motion_deps_available %}disabled{% endif %}>
+      <span class="value" id="motionCooldownVal"></span>
+    </div>
+
+    <div id="motionStatus">Checking motion detection status…</div>
+  </fieldset>
+
   <button id="saveBtn">Save Picture</button>
   <button id="saveDefaultsBtn" class="secondary">Save Current Settings as Default</button>
 
@@ -394,6 +503,7 @@ PAGE = """
           status.className = 'ok';
           preview.src = '/preview/' + data.filename + '?t=' + Date.now();
           preview.style.display = 'block';
+          loadGallery(0);
         } else {
           status.textContent = 'Error: ' + (data.error || 'unknown error');
           status.className = 'err';
@@ -434,7 +544,7 @@ PAGE = """
         img.alt = photo.filename;
         const cap = document.createElement('div');
         cap.className = 'cap';
-        cap.textContent = photo.filename;
+        cap.textContent = photo.filename + (photo.filename.startsWith('motion_') ? ' · auto' : '');
         div.appendChild(img);
         div.appendChild(cap);
         div.addEventListener('click', () => {
@@ -498,6 +608,71 @@ PAGE = """
         saveDefaultsBtn.disabled = false;
       }
     });
+
+    // ---- Motion detection controls (apply immediately, not just on "save as default") ----
+    const motionEnabled = document.getElementById('motionEnabled');
+    const motionSensitivity = document.getElementById('motionSensitivity');
+    const motionSensitivityVal = document.getElementById('motionSensitivityVal');
+    const motionCooldown = document.getElementById('motionCooldown');
+    const motionCooldownVal = document.getElementById('motionCooldownVal');
+    const motionStatusEl = document.getElementById('motionStatus');
+
+    function updateMotionValueLabels() {
+      motionSensitivityVal.textContent = motionSensitivity.value;
+      motionCooldownVal.textContent = motionCooldown.value + 's';
+    }
+    updateMotionValueLabels();
+
+    async function postMotionSettings() {
+      updateMotionValueLabels();
+      try {
+        await fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            motion_enabled: motionEnabled.checked,
+            motion_sensitivity: motionSensitivity.value,
+            motion_cooldown: motionCooldown.value,
+          })
+        });
+      } catch (e) {
+        // Best-effort; the status poll below will reflect the real state either way.
+      }
+      refreshMotionStatus();
+    }
+
+    motionEnabled.addEventListener('change', postMotionSettings);
+    motionSensitivity.addEventListener('change', postMotionSettings);
+    motionCooldown.addEventListener('change', postMotionSettings);
+    motionSensitivity.addEventListener('input', updateMotionValueLabels);
+    motionCooldown.addEventListener('input', updateMotionValueLabels);
+
+    async function refreshMotionStatus() {
+      try {
+        const resp = await fetch('/motion/status');
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) return;
+
+        if (!data.deps_available) {
+          motionStatusEl.textContent = 'Motion detection unavailable — missing Pillow/NumPy on the Pi.';
+        } else if (!data.enabled) {
+          motionStatusEl.textContent = 'Motion detection: paused.';
+        } else if (data.last_capture_at) {
+          const when = new Date(data.last_capture_at).toLocaleTimeString();
+          motionStatusEl.textContent = 'Motion detection: running • last auto-capture ' + when + '.';
+        } else {
+          motionStatusEl.textContent = 'Motion detection: running • watching for activity…';
+        }
+
+        if (data.last_capture_filename) {
+          loadGallery(0);
+        }
+      } catch (e) {
+        motionStatusEl.textContent = 'Motion detection: status unavailable.';
+      }
+    }
+    refreshMotionStatus();
+    setInterval(refreshMotionStatus, 5000);
   </script>
 </body>
 </html>
@@ -537,39 +712,31 @@ def _roi_from_margins(top, bottom, left, right):
     return f"{x:.3f},{y:.3f},{w:.3f},{h:.3f}"
 
 
-@app.route("/")
-def index():
-    saved = load_settings()
-    return render_template_string(PAGE, resolutions=list(RESOLUTIONS.keys()), specs=PARAM_SPECS, saved=saved)
+class CaptureError(Exception):
+    """Raised when a camera capture fails for any reason."""
 
 
-@app.route("/save", methods=["POST"])
-def save_picture():
+def _capture_photo(resolution, top, bottom, left, right, contrast, saturation, ev, prefix="capture"):
+    """
+    Run the camera capture CLI and save a full-resolution JPEG to
+    PICTURES_DIR. Returns (filename, output_path, roi). Raises CaptureError
+    or ValueError (invalid crop combination) on failure.
+
+    Shared by the manual /save route and the background motion-detection
+    thread; CAMERA_LOCK ensures only one of them ever touches the camera
+    at a time.
+    """
     if CAMERA_CMD is None:
-        return jsonify(ok=False, error="No camera CLI found (rpicam-still / libcamera-still)."), 500
+        raise CaptureError("No camera CLI found (rpicam-still / libcamera-still).")
 
-    data = request.get_json(silent=True) or {}
-    defaults = load_settings()
-
-    resolution = data.get("resolution", defaults["resolution"])
     if resolution not in RESOLUTIONS:
-        return jsonify(ok=False, error=f"Unknown resolution '{resolution}'."), 400
+        raise CaptureError(f"Unknown resolution '{resolution}'.")
     width, height = RESOLUTIONS[resolution]
 
-    try:
-        top = _validate_range("top", data.get("top", defaults["top"]), PARAM_SPECS["top"])
-        bottom = _validate_range("bottom", data.get("bottom", defaults["bottom"]), PARAM_SPECS["bottom"])
-        left = _validate_range("left", data.get("left", defaults["left"]), PARAM_SPECS["left"])
-        right = _validate_range("right", data.get("right", defaults["right"]), PARAM_SPECS["right"])
-        contrast = _validate_range("contrast", data.get("contrast", defaults["contrast"]), PARAM_SPECS["contrast"])
-        saturation = _validate_range("saturation", data.get("saturation", defaults["saturation"]), PARAM_SPECS["saturation"])
-        ev = _validate_range("ev", data.get("ev", defaults["ev"]), PARAM_SPECS["ev"])
-        roi = _roi_from_margins(top, bottom, left, right)
-    except ValueError as e:
-        return jsonify(ok=False, error=str(e)), 400
+    roi = _roi_from_margins(top, bottom, left, right)  # may raise ValueError
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"capture_{resolution}_{timestamp}.jpg"
+    filename = f"{prefix}_{resolution}_{timestamp}.jpg"
     output_path = PICTURES_DIR / filename
 
     cmd = [
@@ -588,17 +755,220 @@ def save_picture():
         "--nopreview",
     ]
 
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15
-        )
-    except subprocess.TimeoutExpired:
-        return jsonify(ok=False, error="Camera capture timed out."), 500
-    except FileNotFoundError:
-        return jsonify(ok=False, error=f"Camera command not found: {CAMERA_CMD}"), 500
+    with CAMERA_LOCK:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            raise CaptureError("Camera capture timed out.")
+        except FileNotFoundError:
+            raise CaptureError(f"Camera command not found: {CAMERA_CMD}")
 
     if result.returncode != 0 or not output_path.exists():
-        return jsonify(ok=False, error=result.stderr.strip() or "Capture failed."), 500
+        raise CaptureError(result.stderr.strip() or "Capture failed.")
+
+    return filename, output_path, roi
+
+
+# ---------------------------------------------------------------------------
+# Motion detection (automatic, unattended capture)
+# ---------------------------------------------------------------------------
+# Runs as a background thread that starts automatically as soon as app.py
+# starts (see start_motion_thread() near the bottom). It periodically grabs
+# a small low-resolution snapshot of the same feeder area the sliders are
+# framing, compares it against a running background image, and — once
+# enough of the frame has changed for long enough — takes a full-resolution
+# photo the same way the "Save Picture" button does, tagged with a
+# "motion_" filename prefix so it's easy to tell apart from manual shots in
+# the gallery. It can be paused/resumed from the web page at any time.
+
+MOTION_POLL_INTERVAL_SECONDS = 2.0   # how often to check for motion
+MOTION_FRAMES_REQUIRED = 2           # consecutive polls needed before saving
+MOTION_PIXEL_DIFF_THRESHOLD = 25     # per-pixel grayscale change, 0..255
+MOTION_BACKGROUND_ALPHA = 0.05       # how fast the background adapts when calm
+
+MOTION_POLL_TMP = Path(tempfile.gettempdir()) / "mypicam_motion_poll.jpg"
+
+_motion_thread = None
+_motion_stop_event = threading.Event()
+_motion_state = {
+    "last_capture_at": None,       # ISO timestamp string, for the status line
+    "last_capture_filename": None,
+    "last_error": None,
+}
+
+
+def _sensitivity_to_min_area_fraction(sensitivity):
+    """
+    Map the 1-10 "Sensitivity" slider to a fraction of the analysis frame
+    that must change before it counts as motion. 1 = least sensitive
+    (15% of the frame), 10 = most sensitive (1% of the frame).
+    """
+    sensitivity = max(1.0, min(10.0, float(sensitivity)))
+    high_frac, low_frac = 0.15, 0.01
+    return high_frac - (sensitivity - 1) * (high_frac - low_frac) / 9.0
+
+
+def _capture_motion_poll_frame(roi):
+    """
+    Grab a small grayscale snapshot of the feeder area for motion analysis.
+    Returns a PIL Image, or None if the capture failed for any reason.
+    """
+    if CAMERA_CMD is None:
+        return None
+
+    cmd = [
+        CAMERA_CMD,
+        "--width", "320",
+        "--height", "240",
+        "--roi", roi,
+        "--nopreview",
+        "--timeout", "300",
+        "--output", str(MOTION_POLL_TMP),
+    ]
+
+    with CAMERA_LOCK:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        except Exception:
+            return None
+
+    if result.returncode != 0 or not MOTION_POLL_TMP.exists():
+        return None
+
+    try:
+        return Image.open(MOTION_POLL_TMP).convert("L")
+    except Exception:
+        return None
+
+
+def motion_detection_loop():
+    """Background loop: watch the feeder area and auto-save on motion."""
+    background = None
+    motion_frames = 0
+    last_capture_monotonic = 0.0
+
+    print("[motion] Background motion-detection thread started.")
+
+    while not _motion_stop_event.is_set():
+        settings = load_settings()
+
+        if not settings.get("motion_enabled", False):
+            background = None
+            motion_frames = 0
+            _motion_stop_event.wait(MOTION_POLL_INTERVAL_SECONDS)
+            continue
+
+        try:
+            roi = _roi_from_margins(settings["top"], settings["bottom"], settings["left"], settings["right"])
+        except ValueError:
+            roi = "0.000,0.000,1.000,1.000"
+
+        try:
+            frame_img = _capture_motion_poll_frame(roi)
+            if frame_img is None:
+                _motion_stop_event.wait(MOTION_POLL_INTERVAL_SECONDS)
+                continue
+
+            frame_img = frame_img.filter(ImageFilter.GaussianBlur(radius=2))
+            frame = np.asarray(frame_img, dtype=np.float32)
+
+            if background is None:
+                background = frame.copy()
+                _motion_stop_event.wait(MOTION_POLL_INTERVAL_SECONDS)
+                continue
+
+            delta = np.abs(frame - background)
+            changed_count = int(np.count_nonzero(delta > MOTION_PIXEL_DIFF_THRESHOLD))
+            min_area_fraction = _sensitivity_to_min_area_fraction(settings.get("motion_sensitivity", 5))
+            min_area_pixels = min_area_fraction * frame.size
+
+            detected = changed_count >= min_area_pixels
+            motion_frames = motion_frames + 1 if detected else 0
+
+            now = time.monotonic()
+            cooldown = settings.get("motion_cooldown", 20)
+
+            if motion_frames >= MOTION_FRAMES_REQUIRED and (now - last_capture_monotonic) >= cooldown:
+                try:
+                    filename, _, _ = _capture_photo(
+                        settings["resolution"],
+                        settings["top"], settings["bottom"], settings["left"], settings["right"],
+                        settings["contrast"], settings["saturation"], settings["ev"],
+                        prefix="motion",
+                    )
+                    last_capture_monotonic = now
+                    _motion_state["last_capture_at"] = datetime.datetime.now().isoformat()
+                    _motion_state["last_capture_filename"] = filename
+                    _motion_state["last_error"] = None
+                    print(f"[motion] Saved {filename} (changed pixels={changed_count})")
+                except (CaptureError, ValueError) as e:
+                    _motion_state["last_error"] = str(e)
+                    print(f"[motion] Capture failed: {e}")
+
+                motion_frames = 0
+                background = None  # force a fresh background after a capture
+                _motion_stop_event.wait(1.0)
+            else:
+                if not detected:
+                    background = background * (1 - MOTION_BACKGROUND_ALPHA) + frame * MOTION_BACKGROUND_ALPHA
+                _motion_stop_event.wait(MOTION_POLL_INTERVAL_SECONDS)
+
+        except Exception as e:
+            # Never let an unexpected error kill the background thread.
+            _motion_state["last_error"] = str(e)
+            print(f"[motion] Unexpected error: {e}")
+            _motion_stop_event.wait(MOTION_POLL_INTERVAL_SECONDS)
+
+    print("[motion] Background motion-detection thread stopped.")
+
+
+def start_motion_thread():
+    """Start the motion-detection background thread if it isn't running."""
+    global _motion_thread
+    if _motion_thread is not None and _motion_thread.is_alive():
+        return
+    _motion_thread = threading.Thread(target=motion_detection_loop, daemon=True, name="motion-detect")
+    _motion_thread.start()
+
+
+@app.route("/")
+def index():
+    saved = load_settings()
+    return render_template_string(
+        PAGE,
+        resolutions=list(RESOLUTIONS.keys()),
+        specs=PARAM_SPECS,
+        motion_specs=MOTION_SPECS,
+        motion_deps_available=_MOTION_DEPS_AVAILABLE,
+        saved=saved,
+    )
+
+
+@app.route("/save", methods=["POST"])
+def save_picture():
+    data = request.get_json(silent=True) or {}
+    defaults = load_settings()
+
+    resolution = data.get("resolution", defaults["resolution"])
+
+    try:
+        top = _validate_range("top", data.get("top", defaults["top"]), PARAM_SPECS["top"])
+        bottom = _validate_range("bottom", data.get("bottom", defaults["bottom"]), PARAM_SPECS["bottom"])
+        left = _validate_range("left", data.get("left", defaults["left"]), PARAM_SPECS["left"])
+        right = _validate_range("right", data.get("right", defaults["right"]), PARAM_SPECS["right"])
+        contrast = _validate_range("contrast", data.get("contrast", defaults["contrast"]), PARAM_SPECS["contrast"])
+        saturation = _validate_range("saturation", data.get("saturation", defaults["saturation"]), PARAM_SPECS["saturation"])
+        ev = _validate_range("ev", data.get("ev", defaults["ev"]), PARAM_SPECS["ev"])
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 400
+
+    try:
+        filename, output_path, roi = _capture_photo(
+            resolution, top, bottom, left, right, contrast, saturation, ev, prefix="capture"
+        )
+    except (CaptureError, ValueError) as e:
+        status_code = 400 if isinstance(e, ValueError) else 500
+        return jsonify(ok=False, error=str(e)), status_code
 
     return jsonify(ok=True, filename=filename, path=str(output_path), roi=roi)
 
@@ -610,7 +980,8 @@ GALLERY_PAGE_SIZE_MAX = 50
 @app.route("/photos")
 def list_photos():
     """
-    List past captures, most recent first, paginated via ?offset=&limit=.
+    List past captures (manual and motion-triggered), most recent first,
+    paginated via ?offset=&limit=.
     """
     try:
         offset = int(request.args.get("offset", 0))
@@ -659,6 +1030,20 @@ def update_settings():
     return jsonify(ok=True, settings=validated)
 
 
+@app.route("/motion/status")
+def motion_status():
+    settings = load_settings()
+    return jsonify(
+        ok=True,
+        deps_available=_MOTION_DEPS_AVAILABLE,
+        enabled=settings.get("motion_enabled", False),
+        thread_alive=bool(_motion_thread and _motion_thread.is_alive()),
+        last_capture_at=_motion_state.get("last_capture_at"),
+        last_capture_filename=_motion_state.get("last_capture_filename"),
+        last_error=_motion_state.get("last_error"),
+    )
+
+
 @app.route("/preview/<filename>")
 def preview(filename):
     return send_from_directory(PICTURES_DIR, filename)
@@ -670,5 +1055,12 @@ if __name__ == "__main__":
         print("Install with: sudo apt install rpicam-apps")
     else:
         print(f"Using camera command: {CAMERA_CMD}")
+
+    if not _MOTION_DEPS_AVAILABLE:
+        print("WARNING: Pillow/NumPy not found — motion detection is disabled.")
+        print("Install with: sudo apt install -y python3-pil python3-numpy")
+    else:
+        start_motion_thread()
+
     print(f"Pictures will be saved to: {PICTURES_DIR}")
     app.run(host="0.0.0.0", port=5000, debug=False)
