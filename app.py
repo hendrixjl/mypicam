@@ -749,7 +749,9 @@ def _capture_photo(resolution, top, bottom, left, right, contrast, saturation, e
         "--contrast", f"{contrast:.2f}",
         "--saturation", f"{saturation:.2f}",
         "--ev", f"{ev:.2f}",
-        "--metering", "spot",
+        "--metering", "centre",
+        "--awb", "auto",
+        "--denoise", "cdn_hq",
         "--output", str(output_path),
         "--timeout", "1000",   # ms of preview before capture
         "--nopreview",
