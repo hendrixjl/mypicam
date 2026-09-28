@@ -6,4 +6,4 @@ echo sudo systemctl daemon-reload
 sudo systemctl daemon-reload
 echo sudo systemctl enable --now pi-camera-gui.service
 sudo systemctl enable --now pi-camera-gui.service
-echo "Check status of pi-camera-gui service via systemctl status pi-camera-gui.service"
+systemctl status pi-camera-gui.service"
