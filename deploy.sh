@@ -1,5 +1,7 @@
 #!/bin/sh
 
+echo sudo apt-get install python3-flask
+sudo apt-get install python3-flask
 echo sudo cp pi-camera-gui.service /etc/systemd/system
 sudo cp pi-camera-gui.service /etc/systemd/system
 echo sudo systemctl daemon-reload
